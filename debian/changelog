@@ -1,5 +1,120 @@
-template-repository (1.0-1) unstable; urgency=medium
+responses (0.18.0-1) unstable; urgency=medium
 
-  * Initial release
+  * Team upload.
+  * New upstream release.
 
- -- Tsic404 <liuheng@deepin.org>  Sat, 28 Jan 2023 13:46:49 +0800
+ -- Thomas Goirand <zigo@debian.org>  Tue, 15 Feb 2022 16:49:39 +0100
+
+responses (0.13.4-1) unstable; urgency=medium
+
+  * Team upload.
+
+  [ Debian Janitor ]
+  * Bump debhelper from old 12 to 13.
+
+  [ Guilherme de Paula Xavier Segundo ]
+  * New upstream version 0.13.4.
+  * d/control:
+    - Add Rules-Requires-Root: no.
+    - Bump Standards-Version to 4.6.0.
+  * d/watch: Bump to version 4 and update source.
+  * d/copyright: Update years and packaging copyright.
+
+ -- Guilherme de Paula Xavier Segundo <guilherme.lnx@gmail.com>  Fri, 03 Sep 2021 09:11:28 -0300
+
+responses (0.12.1-1) unstable; urgency=medium
+
+  * Team upload.
+
+  [ Debian Janitor ]
+  * Bump debhelper from old 9 to 12.
+  * Set upstream metadata fields: Bug-Database, Bug-Submit, Repository,
+    Repository-Browse.
+
+  [ Ondřej Nový ]
+  * d/control: Update Maintainer field with new Debian Python Team
+    contact address.
+  * d/control: Update Vcs-* fields with new Debian Python Team Salsa
+    layout.
+
+  [ Dmitry Shachnev ]
+  * New upstream release.
+    - Compatible with Python 3.9 (closes: #973126).
+  * Update Build-Depends according to upstream setup.py:
+    - Bump python3-pytest requirement to 4.6.
+    - Bump python3-urllib3 requirement to 1.25.10.
+    - Remove python3-cookies, no longer needed.
+  * Make the tests pass:
+    - Use debian/pybuild.testfiles to copy test_responses.py to the build
+      directory and then delete it.
+    - Export empty http_proxy to make local network access work.
+
+ -- Dmitry Shachnev <mitya57@debian.org>  Sat, 14 Nov 2020 19:52:28 +0300
+
+responses (0.9.0-2) unstable; urgency=medium
+
+  [ Ondřej Nový ]
+  * d/tests: Use AUTOPKGTEST_TMP instead of ADTTMP
+  * d/changelog: Remove trailing whitespaces
+  * Convert git repository from git-dpm to gbp layout
+  * Use debhelper-compat instead of debian/compat.
+
+  [ Sandro Tosi ]
+  * Drop python2 support; Closes: #938358
+
+ -- Sandro Tosi <morph@debian.org>  Tue, 24 Dec 2019 10:47:48 -0500
+
+responses (0.9.0-1) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Andrew Starr-Bochicchio <asb@debian.org>  Sat, 07 Apr 2018 17:25:23 -0400
+
+responses (0.8.1-1) unstable; urgency=medium
+
+  [ Ondřej Nový ]
+  * Change directory to $ADTTMP before running Debian tests
+  * d/control: Set Vcs-* to salsa.debian.org
+  * d/copyright: Use https protocol in Format field
+
+  [ Andrew Starr-Bochicchio ]
+  * New upstream release.
+  * Adpot package (Closes: #889779).
+  * Bump Standards-Version to 4.1.3, no changes.
+  * Re-enable build time tests.
+   - Build depend on python{3}-mock, python{3}-pytest, and
+     python{3}-pytest-localserver.
+  * Don't install tests in the "top-level" namespace.
+
+ -- Andrew Starr-Bochicchio <asb@debian.org>  Sat, 17 Mar 2018 19:37:04 -0400
+
+responses (0.5.1-1) unstable; urgency=medium
+
+  * Team upload
+  * New upstream released (Closes: #820020)
+  * Fixed VCS URL (https)
+  * Fixed homepage
+  * Removed hardcoded depends to python-requests, it's added by dh_python
+    automatically (Closes: #784208)
+  * Standards-Version is 3.9.7 now (no change)
+  * Bumped debhelper version to 9
+  * Added build depends to python(3)-cookies
+  * Added simple Debian tests
+  * d/copyright:
+    - Added myself to Debian part
+    - Added David Cramer to upstream part
+
+ -- Ondřej Nový <novy@ondrej.org>  Tue, 05 Apr 2016 13:55:43 +0200
+
+responses (0.3.0-1) unstable; urgency=medium
+
+  * New upstream release
+
+ -- Simon Chopin <chopin.simon@gmail.com>  Tue, 14 Oct 2014 03:55:41 +0200
+
+responses (0.2.2-1) unstable; urgency=low
+
+  * Initial release (Closes: #763273)
+  * Disabling test runs as they are not provided within the upstream tarball
+
+ -- Simon Chopin <chopin.simon@gmail.com>  Sun, 12 Oct 2014 22:14:44 +0200
