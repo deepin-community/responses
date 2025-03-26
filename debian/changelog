@@ -1,3 +1,65 @@
+responses (0.25.7-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+
+ -- Colin Watson <cjwatson@debian.org>  Sun, 23 Mar 2025 20:24:34 +0000
+
+responses (0.25.6-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+
+ -- Colin Watson <cjwatson@debian.org>  Sun, 19 Jan 2025 20:07:48 +0000
+
+responses (0.25.3-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+
+ -- Colin Watson <cjwatson@debian.org>  Tue, 18 Jun 2024 14:27:23 +0100
+
+responses (0.25.2-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+  * Use pybuild-plugin-pyproject.
+  * Standards-Version: 4.7.0 (no changes required).
+
+ -- Colin Watson <cjwatson@debian.org>  Mon, 10 Jun 2024 10:11:46 +0100
+
+responses (0.25.0-1) unstable; urgency=medium
+
+  * Team upload.
+  * New upstream release.
+
+ -- Colin Watson <cjwatson@debian.org>  Mon, 13 May 2024 12:22:05 +0100
+
+responses (0.24.1-2) unstable; urgency=medium
+
+  * Team upload.
+
+  * d/patches: Create 0001-Fix-async-test-errors.patch (Closes: #1066776)
+
+ -- Guilherme Puida Moreira <guilherme@puida.xyz>  Wed, 20 Mar 2024 07:18:21 -0300
+
+responses (0.24.1-1) unstable; urgency=medium
+
+  * Team upload.
+
+  [ Debian Janitor ]
+  * Update standards version to 4.6.1, no changes needed.
+
+  [ Guilherme Puida Moreira ]
+  * New upstream version 0.24.1.
+  * d/control:
+    - Replace pytest-localserver with pytest-httpserver.
+    - Add new upstream dependencies.
+    - Bump Standards-Version to 4.6.2, no changes needed.
+    - Add <!nocheck> to test-only dependencies.
+
+ -- Guilherme Puida Moreira <guilherme@puida.xyz>  Thu, 23 Nov 2023 20:44:54 -0300
+
 responses (0.18.0-1) unstable; urgency=medium
 
   * Team upload.

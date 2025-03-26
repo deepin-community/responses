@@ -1,76 +1,123 @@
-from __future__ import absolute_import, print_function, division, unicode_literals
-
-import _io
-from http import client
-from http import cookies
+import inspect
 import json as json_module
 import logging
-import re
-from itertools import groupby
-
-
-from collections import namedtuple
+from functools import partialmethod
 from functools import wraps
-from requests.adapters import HTTPAdapter
-from requests.exceptions import ConnectionError
-from requests.utils import cookiejar_from_dict
-from responses.matchers import json_params_matcher as _json_params_matcher
-from responses.matchers import urlencoded_params_matcher as _urlencoded_params_matcher
-from responses.registries import FirstMatchRegistry
-from responses.matchers import query_string_matcher as _query_string_matcher
+from http import client
+from itertools import groupby
+from re import Pattern
+from threading import Lock as _ThreadingLock
+from typing import TYPE_CHECKING
+from typing import Any
+from typing import Callable
+from typing import Dict
+from typing import Iterable
+from typing import Iterator
+from typing import List
+from typing import Mapping
+from typing import NamedTuple
+from typing import Optional
+from typing import Sequence
+from typing import Sized
+from typing import Tuple
+from typing import Type
+from typing import Union
+from typing import overload
 from warnings import warn
 
-from collections.abc import Sequence, Sized
+import yaml
+from requests.adapters import HTTPAdapter
+from requests.adapters import MaxRetryError
+from requests.exceptions import ConnectionError
+from requests.exceptions import RetryError
+
+from responses.matchers import json_params_matcher as _json_params_matcher
+from responses.matchers import query_string_matcher as _query_string_matcher
+from responses.matchers import urlencoded_params_matcher as _urlencoded_params_matcher
+from responses.registries import FirstMatchRegistry
 
 try:
-    from requests.packages.urllib3.response import HTTPResponse
+    from typing_extensions import Literal
 except ImportError:  # pragma: no cover
-    from urllib3.response import HTTPResponse  # pragma: no cover
-try:
-    from requests.packages.urllib3.connection import HTTPHeaderDict
-except ImportError:  # pragma: no cover
-    from urllib3.response import HTTPHeaderDict  # pragma: no cover
-try:
-    from requests.packages.urllib3.util.url import parse_url
-except ImportError:  # pragma: no cover
-    from urllib3.util.url import parse_url  # pragma: no cover
+    from typing import Literal  # type: ignore  # pragma: no cover
 
-
-from urllib.parse import (
-    urlparse,
-    urlunparse,
-    parse_qsl,
-    urlsplit,
-    urlunsplit,
-    quote,
-)
-
-from io import BytesIO as BufferIO
-
+from io import BufferedReader
+from io import BytesIO
 from unittest import mock as std_mock
+from urllib.parse import parse_qsl
+from urllib.parse import quote
+from urllib.parse import urlsplit
+from urllib.parse import urlunparse
+from urllib.parse import urlunsplit
+
+from urllib3.response import HTTPHeaderDict
+from urllib3.response import HTTPResponse
+from urllib3.util.url import parse_url
+
+if TYPE_CHECKING:  # pragma: no cover
+    # import only for linter run
+    import os
+    from typing import Protocol
+    from unittest.mock import _patch as _mock_patcher
+
+    from requests import PreparedRequest
+    from requests import models
+    from urllib3 import Retry as _Retry
+
+    class UnboundSend(Protocol):
+        def __call__(
+            self,
+            adapter: HTTPAdapter,
+            request: PreparedRequest,
+            *args: Any,
+            **kwargs: Any,
+        ) -> models.Response:
+            ...
+
+    # Block of type annotations
+    _Body = Union[str, BaseException, "Response", BufferedReader, bytes, None]
+    _F = Callable[..., Any]
+    _HeaderSet = Optional[Union[Mapping[str, str], List[Tuple[str, str]]]]
+    _MatcherIterable = Iterable[Callable[..., Tuple[bool, str]]]
+    _HTTPMethodOrResponse = Optional[Union[str, "BaseResponse"]]
+    _URLPatternType = Union["Pattern[str]", str]
+    _HTTPAdapterSend = Callable[
+        [
+            HTTPAdapter,
+            PreparedRequest,
+            bool,
+            Union[float, Tuple[float, float], Tuple[float, None], None],
+            Union[bool, str],
+            Union[bytes, str, Tuple[Union[bytes, str], Union[bytes, str]], None],
+            Optional[Mapping[str, str]],
+        ],
+        models.Response,
+    ]
 
 
-Pattern = re.Pattern
+class Call(NamedTuple):
+    request: "PreparedRequest"
+    response: "_Body"
 
-UNSET = object()
-
-Call = namedtuple("Call", ["request", "response"])
 
 _real_send = HTTPAdapter.send
+_UNSET = object()
 
 logger = logging.getLogger("responses")
 
 
 class FalseBool:
-    # used for backwards compatibility, see
-    # https://github.com/getsentry/responses/issues/464
-    def __bool__(self):
+    """Class to mock up built-in False boolean.
+
+    Used for backwards compatibility, see
+    https://github.com/getsentry/responses/issues/464
+    """
+
+    def __bool__(self) -> bool:
         return False
 
-    __nonzero__ = __bool__
 
-
-def urlencoded_params_matcher(params):
+def urlencoded_params_matcher(params: Optional[Dict[str, str]]) -> Callable[..., Any]:
     warn(
         "Function is deprecated. Use 'from responses.matchers import urlencoded_params_matcher'",
         DeprecationWarning,
@@ -78,7 +125,7 @@ def urlencoded_params_matcher(params):
     return _urlencoded_params_matcher(params)
 
 
-def json_params_matcher(params):
+def json_params_matcher(params: Optional[Dict[str, Any]]) -> Callable[..., Any]:
     warn(
         "Function is deprecated. Use 'from responses.matchers import json_params_matcher'",
         DeprecationWarning,
@@ -86,12 +133,26 @@ def json_params_matcher(params):
     return _json_params_matcher(params)
 
 
-def _has_unicode(s):
+def _has_unicode(s: str) -> bool:
     return any(ord(char) > 128 for char in s)
 
 
-def _clean_unicode(url):
-    # Clean up domain names, which use punycode to handle unicode chars
+def _clean_unicode(url: str) -> str:
+    """Clean up URLs, which use punycode to handle unicode chars.
+
+    Applies percent encoding to URL path and query if required.
+
+    Parameters
+    ----------
+    url : str
+        URL that should be cleaned from unicode
+
+    Returns
+    -------
+    str
+        Cleaned URL
+
+    """
     urllist = list(urlsplit(url))
     netloc = urllist[1]
     if _has_unicode(netloc):
@@ -112,72 +173,180 @@ def _clean_unicode(url):
     return "".join(chars)
 
 
-def _cookies_from_headers(headers):
-    resp_cookie = cookies.SimpleCookie()
-    resp_cookie.load(headers["set-cookie"])
-    cookies_dict = {name: v.value for name, v in resp_cookie.items()}
+def get_wrapped(
+    func: Callable[..., Any],
+    responses: "RequestsMock",
+    *,
+    registry: Optional[Any] = None,
+    assert_all_requests_are_fired: Optional[bool] = None,
+) -> Callable[..., Any]:
+    """Wrap provided function inside ``responses`` context manager.
 
-    return cookiejar_from_dict(cookies_dict)
+    Provides a synchronous or asynchronous wrapper for the function.
 
 
-def get_wrapped(func, responses, registry=None):
-    if registry is not None:
-        responses._set_registry(registry)
+    Parameters
+    ----------
+    func : Callable
+        Function to wrap.
+    responses : RequestsMock
+        Mock object that is used as context manager.
+    registry : FirstMatchRegistry, optional
+        Custom registry that should be applied. See ``responses.registries``
+    assert_all_requests_are_fired : bool
+        Raise an error if not all registered responses were executed.
 
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        with responses:
-            return func(*args, **kwargs)
+    Returns
+    -------
+    Callable
+        Wrapped function
+
+    """
+    assert_mock = std_mock.patch.object(
+        target=responses,
+        attribute="assert_all_requests_are_fired",
+        new=assert_all_requests_are_fired,
+    )
+
+    if inspect.iscoroutinefunction(func):
+        # set asynchronous wrapper if requestor function is asynchronous
+        @wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            if registry is not None:
+                responses._set_registry(registry)
+
+            with assert_mock, responses:
+                return await func(*args, **kwargs)
+
+    else:
+
+        @wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            if registry is not None:
+                responses._set_registry(registry)
+
+            with assert_mock, responses:
+                # set 'assert_all_requests_are_fired' temporarily for a single run.
+                # Mock automatically unsets to avoid leakage to another decorated
+                # function since we still apply the value on 'responses.mock' object
+                return func(*args, **kwargs)
 
     return wrapper
 
 
-class CallList(Sequence, Sized):
-    def __init__(self):
-        self._calls = []
+class CallList(Sequence[Any], Sized):
+    def __init__(self) -> None:
+        self._calls: List[Call] = []
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Call]:
         return iter(self._calls)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self._calls)
 
-    def __getitem__(self, idx):
+    @overload
+    def __getitem__(self, idx: int) -> Call:
+        ...
+
+    @overload
+    def __getitem__(self, idx: "slice[int, int, Optional[int]]") -> List[Call]:
+        ...
+
+    def __getitem__(self, idx: Union[int, slice]) -> Union[Call, List[Call]]:
         return self._calls[idx]
 
-    def add(self, request, response):
+    def add(self, request: "PreparedRequest", response: "_Body") -> None:
         self._calls.append(Call(request, response))
 
-    def reset(self):
+    def add_call(self, call: Call) -> None:
+        self._calls.append(call)
+
+    def reset(self) -> None:
         self._calls = []
 
 
-def _ensure_url_default_path(url):
+def _ensure_url_default_path(
+    url: "_URLPatternType",
+) -> "_URLPatternType":
+    """Add empty URL path '/' if doesn't exist.
+
+    Examples
+    --------
+    >>> _ensure_url_default_path("http://example.com")
+    "http://example.com/"
+
+    Parameters
+    ----------
+    url : str or re.Pattern
+        URL to validate.
+
+    Returns
+    -------
+    url : str or re.Pattern
+        Modified URL if str or unchanged re.Pattern
+
+    """
     if isinstance(url, str):
         url_parts = list(urlsplit(url))
         if url_parts[2] == "":
             url_parts[2] = "/"
-        url = urlunsplit(url_parts)
+            url = urlunsplit(url_parts)
     return url
 
 
-def _get_url_and_path(url):
-    url_parsed = urlparse(url)
+def _get_url_and_path(url: str) -> str:
+    """Construct URL only containing scheme, netloc and path by truncating other parts.
+
+    This method complies with RFC 3986.
+
+    Examples
+    --------
+    >>> _get_url_and_path("http://example.com/path;segment?ab=xy&zed=qwe#test=1&foo=bar")
+    "http://example.com/path;segment"
+
+
+    Parameters
+    ----------
+    url : str
+        URL to parse.
+
+    Returns
+    -------
+    url : str
+        URL with scheme, netloc and path
+
+    """
+    url_parsed = urlsplit(url)
     url_and_path = urlunparse(
         [url_parsed.scheme, url_parsed.netloc, url_parsed.path, None, None, None]
     )
     return parse_url(url_and_path).url
 
 
-def _handle_body(body):
+def _handle_body(
+    body: Optional[Union[bytes, BufferedReader, str]]
+) -> Union[BufferedReader, BytesIO]:
+    """Generates `Response` body.
+
+    Parameters
+    ----------
+    body : str or bytes or BufferedReader
+        Input data to generate `Response` body.
+
+    Returns
+    -------
+    body : BufferedReader or BytesIO
+        `Response` body
+
+    """
     if isinstance(body, str):
         body = body.encode("utf-8")
-    if isinstance(body, _io.BufferedReader):
+    if isinstance(body, BufferedReader):
         return body
 
-    data = BufferIO(body)
+    data = BytesIO(body)  # type: ignore[arg-type]
 
-    def is_closed():
+    def is_closed() -> bool:
         """
         Real Response uses HTTPResponse as body object.
         Thus, when method is_closed is called first to check if there is any more
@@ -202,29 +371,42 @@ def _handle_body(body):
             # only if file really closed (by us) return True
             return True
 
-    data.isclosed = is_closed
+    data.isclosed = is_closed  # type: ignore[attr-defined]
     return data
 
 
-class BaseResponse(object):
-    passthrough = False
-    content_type = None
-    headers = None
+class BaseResponse:
+    passthrough: bool = False
+    content_type: Optional[str] = None
+    headers: Optional[Mapping[str, str]] = None
+    stream: Optional[bool] = False
 
-    stream = False
-
-    def __init__(self, method, url, match_querystring=None, match=()):
-        self.method = method
+    def __init__(
+        self,
+        method: str,
+        url: "_URLPatternType",
+        match_querystring: Union[bool, object] = None,
+        match: "_MatcherIterable" = (),
+        *,
+        passthrough: bool = False,
+    ) -> None:
+        self.method: str = method
         # ensure the url has a default path set if the url is a string
-        self.url = _ensure_url_default_path(url)
+        self.url: "_URLPatternType" = _ensure_url_default_path(url)
 
         if self._should_match_querystring(match_querystring):
-            match = tuple(match) + (_query_string_matcher(urlparse(self.url).query),)
+            match = tuple(match) + (
+                _query_string_matcher(urlsplit(self.url).query),  # type: ignore[arg-type]
+            )
 
-        self.match = match
-        self.call_count = 0
+        self.match: "_MatcherIterable" = match
+        self._calls: CallList = CallList()
+        self.passthrough = passthrough
 
-    def __eq__(self, other):
+        self.status: int = 200
+        self.body: "_Body" = ""
+
+    def __eq__(self, other: Any) -> bool:
         if not isinstance(other, BaseResponse):
             return False
 
@@ -239,10 +421,12 @@ class BaseResponse(object):
 
         return self_url == other_url
 
-    def __ne__(self, other):
+    def __ne__(self, other: Any) -> bool:
         return not self.__eq__(other)
 
-    def _should_match_querystring(self, match_querystring_argument):
+    def _should_match_querystring(
+        self, match_querystring_argument: Union[bool, object]
+    ) -> Union[bool, object]:
         if isinstance(self.url, Pattern):
             # the old default from <= 0.9.0
             return False
@@ -259,9 +443,28 @@ class BaseResponse(object):
                 )
             return match_querystring_argument
 
-        return bool(urlparse(self.url).query)
+        return bool(urlsplit(self.url).query)
 
-    def _url_matches(self, url, other):
+    def _url_matches(self, url: "_URLPatternType", other: str) -> bool:
+        """Compares two URLs.
+
+        Compares only scheme, netloc and path. If 'url' is a re.Pattern, then checks that
+        'other' matches the pattern.
+
+        Parameters
+        ----------
+        url : Union["Pattern[str]", str]
+            Reference URL or Pattern to compare.
+
+        other : str
+            URl that should be compared.
+
+        Returns
+        -------
+        bool
+            True, if URLs are identical or 'other' matches the pattern.
+
+        """
         if isinstance(url, str):
             if _has_unicode(url):
                 url = _clean_unicode(url)
@@ -275,7 +478,9 @@ class BaseResponse(object):
             return False
 
     @staticmethod
-    def _req_attr_matches(match, request):
+    def _req_attr_matches(
+        match: "_MatcherIterable", request: "PreparedRequest"
+    ) -> Tuple[bool, str]:
         for matcher in match:
             valid, reason = matcher(request)
             if not valid:
@@ -283,22 +488,29 @@ class BaseResponse(object):
 
         return True, ""
 
-    def get_headers(self):
+    def get_headers(self) -> HTTPHeaderDict:
         headers = HTTPHeaderDict()  # Duplicate headers are legal
-        if self.content_type is not None:
+
+        # Add Content-Type if it exists and is not already in headers
+        if self.content_type and (
+            not self.headers or "Content-Type" not in self.headers
+        ):
             headers["Content-Type"] = self.content_type
+
+        # Extend headers if they exist
         if self.headers:
             headers.extend(self.headers)
+
         return headers
 
-    def get_response(self, request):
+    def get_response(self, request: "PreparedRequest") -> HTTPResponse:
         raise NotImplementedError
 
-    def matches(self, request):
+    def matches(self, request: "PreparedRequest") -> Tuple[bool, str]:
         if request.method != self.method:
             return False, "Method does not match"
 
-        if not self._url_matches(self.url, request.url):
+        if not self._url_matches(self.url, str(request.url)):
             return False, "URL does not match"
 
         valid, reason = self._req_attr_matches(self.match, request)
@@ -307,38 +519,91 @@ class BaseResponse(object):
 
         return True, ""
 
+    @property
+    def call_count(self) -> int:
+        return len(self._calls)
+
+    @property
+    def calls(self) -> CallList:
+        return self._calls
+
+
+def _form_response(
+    body: Union[BufferedReader, BytesIO],
+    headers: Optional[Mapping[str, str]],
+    status: int,
+    request_method: Optional[str],
+) -> HTTPResponse:
+    """
+    Function to generate `urllib3.response.HTTPResponse` object.
+
+    The cookie handling functionality of the `requests` library relies on the response object
+    having an original response object with the headers stored in the `msg` attribute.
+    Instead of supplying a file-like object of type `HTTPMessage` for the headers, we provide
+    the headers directly. This approach eliminates the need to parse the headers into a file-like
+    object and then rely on the library to unparse it back. These additional conversions can
+    introduce potential errors.
+    """
+
+    data = BytesIO()
+    data.close()
+
+    """
+    The type `urllib3.response.HTTPResponse` is incorrect; we should
+    use `http.client.HTTPResponse` instead. However, changing this requires opening
+    a real socket to imitate the object. This may not be desired, as some users may
+    want to completely restrict network access in their tests.
+    See https://github.com/getsentry/responses/issues/691
+    """
+    orig_response = HTTPResponse(
+        body=data,  # required to avoid "ValueError: Unable to determine whether fp is closed."
+        msg=headers,  # type: ignore[arg-type]
+        preload_content=False,
+    )
+    return HTTPResponse(
+        status=status,
+        reason=client.responses.get(status, None),
+        body=body,
+        headers=headers,
+        original_response=orig_response,  # type: ignore[arg-type]  # See comment above
+        preload_content=False,
+        request_method=request_method,
+    )
+
 
 class Response(BaseResponse):
     def __init__(
         self,
-        method,
-        url,
-        body="",
-        json=None,
-        status=200,
-        headers=None,
-        stream=None,
-        content_type=UNSET,
-        auto_calculate_content_length=False,
-        **kwargs
-    ):
+        method: str,
+        url: "_URLPatternType",
+        body: "_Body" = "",
+        json: Optional[Any] = None,
+        status: int = 200,
+        headers: Optional[Mapping[str, str]] = None,
+        stream: Optional[bool] = None,
+        content_type: Union[str, object] = _UNSET,
+        auto_calculate_content_length: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(method, url, **kwargs)
+
         # if we were passed a `json` argument,
         # override the body and content_type
         if json is not None:
             assert not body
             body = json_module.dumps(json)
-            if content_type is UNSET:
+            if content_type is _UNSET:
                 content_type = "application/json"
 
-        if content_type is UNSET:
+        if content_type is _UNSET:
             if isinstance(body, str) and _has_unicode(body):
                 content_type = "text/plain; charset=utf-8"
             else:
                 content_type = "text/plain"
 
-        self.body = body
-        self.status = status
-        self.headers = headers
+        self.body: "_Body" = body
+        self.status: int = status
+        self.headers: Optional[Mapping[str, str]] = headers
 
         if stream is not None:
             warn(
@@ -346,37 +611,32 @@ class Response(BaseResponse):
                 DeprecationWarning,
             )
 
-        self.stream = stream
-        self.content_type = content_type
-        self.auto_calculate_content_length = auto_calculate_content_length
-        super(Response, self).__init__(method, url, **kwargs)
+        self.stream: Optional[bool] = stream
+        self.content_type: str = content_type  # type: ignore[assignment]
+        self.auto_calculate_content_length: bool = auto_calculate_content_length
 
-    def get_response(self, request):
+    def get_response(self, request: "PreparedRequest") -> HTTPResponse:
         if self.body and isinstance(self.body, Exception):
+            setattr(self.body, "request", request)
             raise self.body
 
         headers = self.get_headers()
         status = self.status
+
+        assert not isinstance(self.body, (Response, BaseException))
         body = _handle_body(self.body)
 
         if (
             self.auto_calculate_content_length
-            and isinstance(body, BufferIO)
+            and isinstance(body, BytesIO)
             and "Content-Length" not in headers
         ):
             content_length = len(body.getvalue())
             headers["Content-Length"] = str(content_length)
 
-        return HTTPResponse(
-            status=status,
-            reason=client.responses.get(status, None),
-            body=body,
-            headers=headers,
-            original_response=OriginalResponseShim(headers),
-            preload_content=False,
-        )
+        return _form_response(body, headers, status, request.method)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (
             "<Response(url='{url}' status={status} "
             "content_type='{content_type}' headers='{headers}')>".format(
@@ -390,8 +650,16 @@ class Response(BaseResponse):
 
 class CallbackResponse(BaseResponse):
     def __init__(
-        self, method, url, callback, stream=None, content_type="text/plain", **kwargs
-    ):
+        self,
+        method: str,
+        url: "_URLPatternType",
+        callback: Callable[[Any], Any],
+        stream: Optional[bool] = None,
+        content_type: Optional[str] = "text/plain",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(method, url, **kwargs)
+
         self.callback = callback
 
         if stream is not None:
@@ -399,11 +667,10 @@ class CallbackResponse(BaseResponse):
                 "stream argument is deprecated. Use stream parameter in request directly",
                 DeprecationWarning,
             )
-        self.stream = stream
-        self.content_type = content_type
-        super(CallbackResponse, self).__init__(method, url, **kwargs)
+        self.stream: Optional[bool] = stream
+        self.content_type: Optional[str] = content_type
 
-    def get_response(self, request):
+    def get_response(self, request: "PreparedRequest") -> HTTPResponse:
         headers = self.get_headers()
 
         result = self.callback(request)
@@ -430,74 +697,71 @@ class CallbackResponse(BaseResponse):
         body = _handle_body(body)
         headers.extend(r_headers)
 
-        return HTTPResponse(
-            status=status,
-            reason=client.responses.get(status, None),
-            body=body,
-            headers=headers,
-            original_response=OriginalResponseShim(headers),
-            preload_content=False,
-        )
+        return _form_response(body, headers, status, request.method)
 
 
 class PassthroughResponse(BaseResponse):
-    passthrough = True
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, passthrough=True, **kwargs)
 
 
-class OriginalResponseShim(object):
-    """
-    Shim for compatibility with older versions of urllib3
+class RequestsMock:
+    DELETE: Literal["DELETE"] = "DELETE"
+    GET: Literal["GET"] = "GET"
+    HEAD: Literal["HEAD"] = "HEAD"
+    OPTIONS: Literal["OPTIONS"] = "OPTIONS"
+    PATCH: Literal["PATCH"] = "PATCH"
+    POST: Literal["POST"] = "POST"
+    PUT: Literal["PUT"] = "PUT"
 
-    requests cookie handling depends on responses having a property chain of
-    `response._original_response.msg` which contains the response headers [1]
+    Response: Type[Response] = Response
 
-    Using HTTPResponse() for this purpose causes compatibility errors with
-    urllib3<1.23.0. To avoid adding more dependencies we can use this shim.
+    # Make the `matchers` name available under a RequestsMock instance
+    from responses import matchers
 
-    [1]: https://github.com/psf/requests/blob/75bdc998e2d/requests/cookies.py#L125
-    """
-
-    def __init__(self, headers):
-        self.msg = headers
-
-    def isclosed(self):
-        return True
-
-    def close(self):
-        return
-
-
-class RequestsMock(object):
-    DELETE = "DELETE"
-    GET = "GET"
-    HEAD = "HEAD"
-    OPTIONS = "OPTIONS"
-    PATCH = "PATCH"
-    POST = "POST"
-    PUT = "PUT"
-    response_callback = None
+    response_callback: Optional[Callable[[Any], Any]] = None
 
     def __init__(
         self,
-        assert_all_requests_are_fired=True,
-        response_callback=None,
-        passthru_prefixes=(),
-        target="requests.adapters.HTTPAdapter.send",
-        registry=FirstMatchRegistry,
-    ):
-        self._calls = CallList()
+        assert_all_requests_are_fired: bool = True,
+        response_callback: Optional[Callable[[Any], Any]] = None,
+        passthru_prefixes: Tuple[str, ...] = (),
+        target: str = "requests.adapters.HTTPAdapter.send",
+        registry: Type[FirstMatchRegistry] = FirstMatchRegistry,
+        *,
+        real_adapter_send: "_HTTPAdapterSend" = _real_send,
+    ) -> None:
+        self._calls: CallList = CallList()
         self.reset()
-        self._registry = registry()  # call only after reset
-        self.assert_all_requests_are_fired = assert_all_requests_are_fired
-        self.response_callback = response_callback
-        self.passthru_prefixes = tuple(passthru_prefixes)
-        self.target = target
-        self._patcher = None
+        self._registry: FirstMatchRegistry = registry()  # call only after reset
+        self.assert_all_requests_are_fired: bool = assert_all_requests_are_fired
+        self.response_callback: Optional[Callable[[Any], Response]] = response_callback
+        self.passthru_prefixes: Tuple[_URLPatternType, ...] = tuple(passthru_prefixes)
+        self.target: str = target
+        self._patcher: Optional["_mock_patcher[Any]"] = None
+        self._thread_lock = _ThreadingLock()
+        self._real_send = real_adapter_send
 
-    def _get_registry(self):
+    def get_registry(self) -> FirstMatchRegistry:
+        """Returns current registry instance with responses.
+
+        Returns
+        -------
+        FirstMatchRegistry
+            Current registry instance with responses.
+
+        """
         return self._registry
 
-    def _set_registry(self, new_registry):
+    def _set_registry(self, new_registry: Type[FirstMatchRegistry]) -> None:
+        """Replaces current registry with `new_registry`.
+
+        Parameters
+        ----------
+        new_registry : Type[FirstMatchRegistry]
+            Class reference of the registry that should be set, eg OrderedRegistry
+
+        """
         if self.registered():
             err_msg = (
                 "Cannot replace Registry, current registry has responses.\n"
@@ -507,20 +771,21 @@ class RequestsMock(object):
 
         self._registry = new_registry()
 
-    def reset(self):
+    def reset(self) -> None:
+        """Resets registry (including type), calls, passthru_prefixes to default values."""
         self._registry = FirstMatchRegistry()
         self._calls.reset()
         self.passthru_prefixes = ()
 
     def add(
         self,
-        method=None,  # method or ``Response``
-        url=None,
-        body="",
-        adding_headers=None,
-        *args,
-        **kwargs
-    ):
+        method: "_HTTPMethodOrResponse" = None,
+        url: "Optional[_URLPatternType]" = None,
+        body: "_Body" = "",
+        adding_headers: "_HeaderSet" = None,
+        *args: Any,
+        **kwargs: Any,
+    ) -> BaseResponse:
         """
         >>> import responses
 
@@ -550,15 +815,58 @@ class RequestsMock(object):
 
         """
         if isinstance(method, BaseResponse):
-            self._registry.add(method)
-            return
+            return self._registry.add(method)
 
         if adding_headers is not None:
             kwargs.setdefault("headers", adding_headers)
+        if (
+            "content_type" in kwargs
+            and "headers" in kwargs
+            and kwargs["headers"] is not None
+        ):
+            header_keys = [header.lower() for header in kwargs["headers"]]
+            if "content-type" in header_keys:
+                raise RuntimeError(
+                    "You cannot define both `content_type` and `headers[Content-Type]`."
+                    " Using the `content_type` kwarg is recommended."
+                )
 
-        self._registry.add(Response(method=method, url=url, body=body, **kwargs))
+        assert url is not None
+        assert isinstance(method, str)
+        response = Response(method=method, url=url, body=body, **kwargs)
+        return self._registry.add(response)
 
-    def add_passthru(self, prefix):
+    delete = partialmethod(add, DELETE)
+    get = partialmethod(add, GET)
+    head = partialmethod(add, HEAD)
+    options = partialmethod(add, OPTIONS)
+    patch = partialmethod(add, PATCH)
+    post = partialmethod(add, POST)
+    put = partialmethod(add, PUT)
+
+    def _parse_response_file(
+        self, file_path: "Union[str, bytes, os.PathLike[Any]]"
+    ) -> "Dict[str, Any]":
+        with open(file_path) as file:
+            data = yaml.safe_load(file)
+        return data
+
+    def _add_from_file(self, file_path: "Union[str, bytes, os.PathLike[Any]]") -> None:
+        data = self._parse_response_file(file_path)
+
+        for rsp in data["responses"]:
+            rsp = rsp["response"]
+            self.add(
+                method=rsp["method"],
+                url=rsp["url"],
+                body=rsp["body"],
+                status=rsp["status"],
+                headers=rsp["headers"] if "headers" in rsp else None,
+                content_type=rsp["content_type"],
+                auto_calculate_content_length=rsp["auto_calculate_content_length"],
+            )
+
+    def add_passthru(self, prefix: "_URLPatternType") -> None:
         """
         Register a URL prefix or regex to passthru any non-matching mock requests to.
 
@@ -570,13 +878,18 @@ class RequestsMock(object):
 
         Regex can be used like:
 
+        >>> import re
         >>> responses.add_passthru(re.compile('https://example.com/\\w+'))
         """
         if not isinstance(prefix, Pattern) and _has_unicode(prefix):
             prefix = _clean_unicode(prefix)
         self.passthru_prefixes += (prefix,)
 
-    def remove(self, method_or_response=None, url=None):
+    def remove(
+        self,
+        method_or_response: "_HTTPMethodOrResponse" = None,
+        url: "Optional[_URLPatternType]" = None,
+    ) -> List[BaseResponse]:
         """
         Removes a response previously added using ``add()``, identified
         either by a response object inheriting ``BaseResponse`` or
@@ -589,11 +902,20 @@ class RequestsMock(object):
         if isinstance(method_or_response, BaseResponse):
             response = method_or_response
         else:
+            assert url is not None
+            assert isinstance(method_or_response, str)
             response = BaseResponse(method=method_or_response, url=url)
 
-        self._registry.remove(response)
+        return self._registry.remove(response)
 
-    def replace(self, method_or_response=None, url=None, body="", *args, **kwargs):
+    def replace(
+        self,
+        method_or_response: "_HTTPMethodOrResponse" = None,
+        url: "Optional[_URLPatternType]" = None,
+        body: "_Body" = "",
+        *args: Any,
+        **kwargs: Any,
+    ) -> BaseResponse:
         """
         Replaces a response previously added using ``add()``. The signature
         is identical to ``add()``. The response is identified using ``method``
@@ -604,14 +926,22 @@ class RequestsMock(object):
         >>> responses.replace(responses.GET, 'http://example.org', json={'data': 2})
         """
         if isinstance(method_or_response, BaseResponse):
-            url = method_or_response.url
             response = method_or_response
         else:
+            assert url is not None
+            assert isinstance(method_or_response, str)
             response = Response(method=method_or_response, url=url, body=body, **kwargs)
 
-        self._registry.replace(response)
+        return self._registry.replace(response)
 
-    def upsert(self, method_or_response=None, url=None, body="", *args, **kwargs):
+    def upsert(
+        self,
+        method_or_response: "_HTTPMethodOrResponse" = None,
+        url: "Optional[_URLPatternType]" = None,
+        body: "_Body" = "",
+        *args: Any,
+        **kwargs: Any,
+    ) -> BaseResponse:
         """
         Replaces a response previously added using ``add()``, or adds the response
         if no response exists.  Responses are matched using ``method``and ``url``.
@@ -622,22 +952,22 @@ class RequestsMock(object):
         >>> responses.upsert(responses.GET, 'http://example.org', json={'data': 2})
         """
         try:
-            self.replace(method_or_response, url, body, *args, **kwargs)
+            return self.replace(method_or_response, url, body, *args, **kwargs)
         except ValueError:
-            self.add(method_or_response, url, body, *args, **kwargs)
+            return self.add(method_or_response, url, body, *args, **kwargs)
 
     def add_callback(
         self,
-        method,
-        url,
-        callback,
-        match_querystring=FalseBool(),
-        content_type="text/plain",
-        match=(),
-    ):
-        # ensure the url has a default path set if the url is a string
-        # url = _ensure_url_default_path(url, match_querystring)
-
+        method: str,
+        url: "_URLPatternType",
+        callback: Callable[
+            ["PreparedRequest"],
+            Union[Exception, Tuple[int, Mapping[str, str], "_Body"]],
+        ],
+        match_querystring: Union[bool, FalseBool] = FalseBool(),
+        content_type: Optional[str] = "text/plain",
+        match: "_MatcherIterable" = (),
+    ) -> None:
         self._registry.add(
             CallbackResponse(
                 url=url,
@@ -649,33 +979,64 @@ class RequestsMock(object):
             )
         )
 
-    def registered(self):
+    def registered(self) -> List["BaseResponse"]:
         return self._registry.registered
 
     @property
-    def calls(self):
+    def calls(self) -> CallList:
         return self._calls
 
-    def __enter__(self):
+    def __enter__(self) -> "RequestsMock":
         self.start()
         return self
 
-    def __exit__(self, type, value, traceback):
+    def __exit__(self, type: Any, value: Any, traceback: Any) -> bool:
         success = type is None
-        self.stop(allow_assert=success)
-        self.reset()
+        try:
+            self.stop(allow_assert=success)
+        finally:
+            self.reset()
         return success
 
-    def activate(self, func=None, registry=None):
+    @overload
+    def activate(self, func: "_F" = ...) -> "_F":
+        """Overload for scenario when 'responses.activate' is used."""
+
+    @overload
+    def activate(  # type: ignore[misc]
+        self,
+        *,
+        registry: Type[Any] = ...,
+        assert_all_requests_are_fired: bool = ...,
+    ) -> Callable[["_F"], "_F"]:
+        """Overload for scenario when
+        'responses.activate(registry=, assert_all_requests_are_fired=True)' is used.
+        See https://github.com/getsentry/responses/pull/469 for more details
+        """
+
+    def activate(
+        self,
+        func: Optional["_F"] = None,
+        *,
+        registry: Optional[Type[Any]] = None,
+        assert_all_requests_are_fired: bool = False,
+    ) -> Union[Callable[["_F"], "_F"], "_F"]:
         if func is not None:
             return get_wrapped(func, self)
 
-        def deco_activate(func):
-            return get_wrapped(func, self, registry)
+        def deco_activate(function: "_F") -> Callable[..., Any]:
+            return get_wrapped(
+                function,
+                self,
+                registry=registry,
+                assert_all_requests_are_fired=assert_all_requests_are_fired,
+            )
 
         return deco_activate
 
-    def _find_match(self, request):
+    def _find_match(
+        self, request: "PreparedRequest"
+    ) -> Tuple[Optional["BaseResponse"], List[str]]:
         """
         Iterates through all available matches and validates if any of them matches the request
 
@@ -684,22 +1045,50 @@ class RequestsMock(object):
             (Response) found match. If multiple found, then remove & return the first match.
             (list) list with reasons why other matches don't match
         """
-        return self._registry.find(request)
+        with self._thread_lock:
+            return self._registry.find(request)
 
-    def _parse_request_params(self, url):
-        params = {}
-        for key, val in groupby(parse_qsl(urlparse(url).query), lambda kv: kv[0]):
+    def _parse_request_params(
+        self, url: str
+    ) -> Dict[str, Union[str, int, float, List[Optional[Union[str, int, float]]]]]:
+        params: Dict[str, Union[str, int, float, List[Any]]] = {}
+        for key, val in groupby(parse_qsl(urlsplit(url).query), lambda kv: kv[0]):
             values = list(map(lambda x: x[1], val))
             if len(values) == 1:
-                values = values[0]
+                values = values[0]  # type: ignore[assignment]
             params[key] = values
         return params
 
-    def _on_request(self, adapter, request, **kwargs):
+    def _read_filelike_body(
+        self, body: Union[str, bytes, BufferedReader, None]
+    ) -> Union[str, bytes, None]:
+        # Requests/urllib support multiple types of body, including file-like objects.
+        # Read from the file if it's a file-like object to avoid storing a closed file
+        # in the call list and allow the user to compare against the data that was in the
+        # request.
+        # See GH #719
+        if isinstance(body, str) or isinstance(body, bytes) or body is None:
+            return body
+        # Based on
+        # https://github.com/urllib3/urllib3/blob/abbfbcb1dd274fc54b4f0a7785fd04d59b634195/src/urllib3/util/request.py#L220
+        if hasattr(body, "read") or isinstance(body, BufferedReader):
+            return body.read()
+        return body
+
+    def _on_request(
+        self,
+        adapter: "HTTPAdapter",
+        request: "PreparedRequest",
+        *,
+        retries: Optional["_Retry"] = None,
+        **kwargs: Any,
+    ) -> "models.Response":
         # add attributes params and req_kwargs to 'request' object for further match comparison
         # original request object does not have these attributes
-        request.params = self._parse_request_params(request.path_url)
-        request.req_kwargs = kwargs
+        request.params = self._parse_request_params(request.path_url)  # type: ignore[attr-defined]
+        request.req_kwargs = kwargs  # type: ignore[attr-defined]
+        request_url = str(request.url)
+        request.body = self._read_filelike_body(request.body)
 
         match, match_failed_reasons = self._find_match(request)
         resp_callback = self.response_callback
@@ -707,60 +1096,132 @@ class RequestsMock(object):
         if match is None:
             if any(
                 [
-                    p.match(request.url)
+                    p.match(request_url)
                     if isinstance(p, Pattern)
-                    else request.url.startswith(p)
+                    else request_url.startswith(p)
                     for p in self.passthru_prefixes
                 ]
             ):
-                logger.info("request.allowed-passthru", extra={"url": request.url})
-                return _real_send(adapter, request, **kwargs)
+                logger.info("request.allowed-passthru", extra={"url": request_url})
+                return self._real_send(adapter, request, **kwargs)  # type: ignore
 
             error_msg = (
                 "Connection refused by Responses - the call doesn't "
                 "match any registered mock.\n\n"
                 "Request: \n"
-                "- %s %s\n\n"
-                "Available matches:\n" % (request.method, request.url)
+                f"- {request.method} {request_url}\n\n"
+                "Available matches:\n"
             )
             for i, m in enumerate(self.registered()):
                 error_msg += "- {} {} {}\n".format(
                     m.method, m.url, match_failed_reasons[i]
                 )
 
+            if self.passthru_prefixes:
+                error_msg += "Passthru prefixes:\n"
+                for p in self.passthru_prefixes:
+                    error_msg += f"- {p}\n"
+
             response = ConnectionError(error_msg)
             response.request = request
 
             self._calls.add(request, response)
-            response = resp_callback(response) if resp_callback else response
             raise response
 
         if match.passthrough:
-            logger.info("request.passthrough-response", extra={"url": request.url})
-            response = _real_send(adapter, request, **kwargs)
+            logger.info("request.passthrough-response", extra={"url": request_url})
+            response = self._real_send(adapter, request, **kwargs)  # type: ignore
         else:
             try:
-                response = adapter.build_response(request, match.get_response(request))
+                response = adapter.build_response(  # type: ignore[assignment]
+                    request, match.get_response(request)
+                )
             except BaseException as response:
-                match.call_count += 1
-                self._calls.add(request, response)
-                response = resp_callback(response) if resp_callback else response
+                call = Call(request, response)
+                self._calls.add_call(call)
+                match.calls.add_call(call)
                 raise
 
-        response = resp_callback(response) if resp_callback else response
-        match.call_count += 1
-        self._calls.add(request, response)
+        if resp_callback:
+            response = resp_callback(response)  # type: ignore[misc]
+        call = Call(request, response)  # type: ignore[misc]
+        self._calls.add_call(call)
+        match.calls.add_call(call)
+
+        retries = retries or adapter.max_retries
+        # first validate that current request is eligible to be retried.
+        # See ``urllib3.util.retry.Retry`` documentation.
+        if retries.is_retry(
+            method=response.request.method, status_code=response.status_code  # type: ignore[misc]
+        ):
+            try:
+                retries = retries.increment(
+                    method=response.request.method,  # type: ignore[misc]
+                    url=response.url,  # type: ignore[misc]
+                    response=response.raw,  # type: ignore[misc]
+                )
+                return self._on_request(adapter, request, retries=retries, **kwargs)
+            except MaxRetryError as e:
+                if retries.raise_on_status:
+                    """Since we call 'retries.increment()' by ourselves, we always set "error"
+                    argument equal to None, thus, MaxRetryError exception will be raised with
+                    ResponseError as a 'reason'.
+
+                    Here we're emulating the `if isinstance(e.reason, ResponseError):`
+                    branch found at:
+                    https://github.com/psf/requests/blob/
+                    177dd90f18a8f4dc79a7d2049f0a3f4fcc5932a0/requests/adapters.py#L549
+                    """
+                    raise RetryError(e, request=request)
+
+                return response
         return response
 
-    def start(self):
-        def unbound_on_send(adapter, request, *a, **kwargs):
-            return self._on_request(adapter, request, *a, **kwargs)
+    def unbound_on_send(self) -> "UnboundSend":
+        def send(
+            adapter: "HTTPAdapter",
+            request: "PreparedRequest",
+            *args: Any,
+            **kwargs: Any,
+        ) -> "models.Response":
+            if args:
+                # that probably means that the request was sent from the custom adapter
+                # It is fully legit to send positional args from adapter, although,
+                # `requests` implementation does it always with kwargs
+                # See for more info: https://github.com/getsentry/responses/issues/642
+                try:
+                    kwargs["stream"] = args[0]
+                    kwargs["timeout"] = args[1]
+                    kwargs["verify"] = args[2]
+                    kwargs["cert"] = args[3]
+                    kwargs["proxies"] = args[4]
+                except IndexError:
+                    # not all kwargs are required
+                    pass
 
-        self._patcher = std_mock.patch(target=self.target, new=unbound_on_send)
+            return self._on_request(adapter, request, **kwargs)
+
+        return send
+
+    def start(self) -> None:
+        if self._patcher:
+            # we must not override value of the _patcher if already applied
+            # this prevents issues when one decorated function is called from
+            # another decorated function
+            return
+
+        self._patcher = std_mock.patch(target=self.target, new=self.unbound_on_send())
         self._patcher.start()
 
-    def stop(self, allow_assert=True):
-        self._patcher.stop()
+    def stop(self, allow_assert: bool = True) -> None:
+        if self._patcher:
+            # prevent stopping unstarted patchers
+            self._patcher.stop()
+
+            # once patcher is stopped, clean it. This is required to create a new
+            # fresh patcher on self.start()
+            self._patcher = None
+
         if not self.assert_all_requests_are_fired:
             return
 
@@ -770,12 +1231,12 @@ class RequestsMock(object):
         not_called = [m for m in self.registered() if m.call_count == 0]
         if not_called:
             raise AssertionError(
-                "Not all requests have been executed {0!r}".format(
+                "Not all requests have been executed {!r}".format(
                     [(match.method, match.url) for match in not_called]
                 )
             )
 
-    def assert_call_count(self, url, count):
+    def assert_call_count(self, url: str, count: int) -> bool:
         call_count = len(
             [
                 1
@@ -787,9 +1248,7 @@ class RequestsMock(object):
             return True
         else:
             raise AssertionError(
-                "Expected URL '{0}' to be called {1} times. Called {2} times.".format(
-                    url, count, call_count
-                )
+                f"Expected URL '{url}' to be called {count} times. Called {call_count} times."
             )
 
 
@@ -802,18 +1261,26 @@ __all__ = [
     # Exposed by the RequestsMock class:
     "activate",
     "add",
+    "_add_from_file",
     "add_callback",
     "add_passthru",
-    "assert_all_requests_are_fired",
+    "_deprecated_assert_all_requests_are_fired",
     "assert_call_count",
     "calls",
+    "delete",
     "DELETE",
+    "get",
     "GET",
+    "head",
     "HEAD",
+    "options",
     "OPTIONS",
-    "passthru_prefixes",
+    "_deprecated_passthru_prefixes",
+    "patch",
     "PATCH",
+    "post",
     "POST",
+    "put",
     "PUT",
     "registered",
     "remove",
@@ -822,24 +1289,33 @@ __all__ = [
     "response_callback",
     "start",
     "stop",
-    "target",
+    "_deprecated_target",
     "upsert",
 ]
 
+# expose only methods and/or read-only methods
 activate = _default_mock.activate
 add = _default_mock.add
+_add_from_file = _default_mock._add_from_file
 add_callback = _default_mock.add_callback
 add_passthru = _default_mock.add_passthru
-assert_all_requests_are_fired = _default_mock.assert_all_requests_are_fired
+_deprecated_assert_all_requests_are_fired = _default_mock.assert_all_requests_are_fired
 assert_call_count = _default_mock.assert_call_count
 calls = _default_mock.calls
+delete = _default_mock.delete
 DELETE = _default_mock.DELETE
+get = _default_mock.get
 GET = _default_mock.GET
+head = _default_mock.head
 HEAD = _default_mock.HEAD
+options = _default_mock.options
 OPTIONS = _default_mock.OPTIONS
-passthru_prefixes = _default_mock.passthru_prefixes
+_deprecated_passthru_prefixes = _default_mock.passthru_prefixes
+patch = _default_mock.patch
 PATCH = _default_mock.PATCH
+post = _default_mock.post
 POST = _default_mock.POST
+put = _default_mock.put
 PUT = _default_mock.PUT
 registered = _default_mock.registered
 remove = _default_mock.remove
@@ -848,5 +1324,18 @@ reset = _default_mock.reset
 response_callback = _default_mock.response_callback
 start = _default_mock.start
 stop = _default_mock.stop
-target = _default_mock.target
+_deprecated_target = _default_mock.target
 upsert = _default_mock.upsert
+
+
+deprecated_names = ["assert_all_requests_are_fired", "passthru_prefixes", "target"]
+
+
+def __getattr__(name: str) -> Any:
+    if name in deprecated_names:
+        warn(
+            f"{name} is deprecated. Please use 'responses.mock.{name}",
+            DeprecationWarning,
+        )
+        return globals()[f"_deprecated_{name}"]
+    raise AttributeError(f"module {__name__} has no attribute {name}")
