@@ -1,51 +1,54 @@
+import gzip
 import json as json_module
+import re
+from json.decoder import JSONDecodeError
+from typing import Any
+from typing import Callable
+from typing import List
+from typing import Mapping
+from typing import MutableMapping
+from typing import Optional
+from typing import Pattern
+from typing import Tuple
+from typing import Union
+from urllib.parse import parse_qsl
+from urllib.parse import urlparse
 
 from requests import PreparedRequest
-from urllib.parse import parse_qsl, urlparse
-from requests.packages.urllib3.util.url import parse_url
-from json.decoder import JSONDecodeError
+from urllib3.util.url import parse_url
 
 
-def _create_key_val_str(input_dict):
-    """
-    Returns string of format {'key': val, 'key2': val2}
-    Function is called recursively for nested dictionaries
+def _filter_dict_recursively(
+    dict1: Mapping[Any, Any], dict2: Mapping[Any, Any]
+) -> Mapping[Any, Any]:
+    filtered_dict = {}
+    for k, val in dict1.items():
+        if k in dict2:
+            if isinstance(val, dict):
+                val = _filter_dict_recursively(val, dict2[k])
+            filtered_dict[k] = val
 
-    :param input_dict: dictionary to transform
-    :return: (str) reformatted string
-    """
-
-    def list_to_str(input_list):
-        """
-        Convert all list items to string.
-        Function is called recursively for nested lists
-        """
-        converted_list = []
-        for item in sorted(input_list, key=lambda x: str(x)):
-            if isinstance(item, dict):
-                item = _create_key_val_str(item)
-            elif isinstance(item, list):
-                item = list_to_str(item)
-
-            converted_list.append(str(item))
-        list_str = ", ".join(converted_list)
-        return "[" + list_str + "]"
-
-    items_list = []
-    for key in sorted(input_dict.keys(), key=lambda x: str(x)):
-        val = input_dict[key]
-        if isinstance(val, dict):
-            val = _create_key_val_str(val)
-        elif isinstance(val, list):
-            val = list_to_str(input_list=val)
-
-        items_list.append("{}: {}".format(key, val))
-
-    key_val_str = "{{{}}}".format(", ".join(items_list))
-    return key_val_str
+    return filtered_dict
 
 
-def urlencoded_params_matcher(params):
+def body_matcher(params: str, *, allow_blank: bool = False) -> Callable[..., Any]:
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
+        reason = ""
+        if isinstance(request.body, bytes):
+            request_body = request.body.decode("utf-8")
+        else:
+            request_body = str(request.body)
+        valid = True if request_body == params else False
+        if not valid:
+            reason = f"request.body doesn't match {params} doesn't match {request_body}"
+        return valid, reason
+
+    return match
+
+
+def urlencoded_params_matcher(
+    params: Optional[Mapping[str, str]], *, allow_blank: bool = False
+) -> Callable[..., Any]:
     """
     Matches URL encoded data
 
@@ -53,15 +56,19 @@ def urlencoded_params_matcher(params):
     :return: (func) matcher
     """
 
-    def match(request):
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = ""
         request_body = request.body
-        qsl_body = dict(parse_qsl(request_body)) if request_body else {}
+        qsl_body = (
+            dict(parse_qsl(request_body, keep_blank_values=allow_blank))  # type: ignore[type-var]
+            if request_body
+            else {}
+        )
         params_dict = params or {}
         valid = params is None if request_body is None else params_dict == qsl_body
         if not valid:
-            reason = "request.body doesn't match: {} doesn't match {}".format(
-                _create_key_val_str(qsl_body), _create_key_val_str(params_dict)
+            reason = (
+                f"request.body doesn't match: {qsl_body} doesn't match {params_dict}"
             )
 
         return valid, reason
@@ -69,29 +76,58 @@ def urlencoded_params_matcher(params):
     return match
 
 
-def json_params_matcher(params):
-    """
-    Matches JSON encoded data
+def json_params_matcher(
+    params: Optional[Union[Mapping[str, Any], List[Any]]], *, strict_match: bool = True
+) -> Callable[..., Any]:
+    """Matches JSON encoded data of request body.
 
-    :param params: (dict) JSON data provided to 'json' arg of request
-    :return: (func) matcher
+    Parameters
+    ----------
+    params : dict or list
+        JSON object provided to 'json' arg of request or a part of it if used in
+        conjunction with ``strict_match=False``.
+    strict_match : bool, default=True
+        Applied only when JSON object is a dictionary.
+        If set to ``True``, validates that all keys of JSON object match.
+        If set to ``False``, original request may contain additional keys.
+
+
+    Returns
+    -------
+    Callable
+        Matcher function.
+
     """
 
-    def match(request):
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = ""
         request_body = request.body
-        params_dict = params or {}
+        json_params = (params or {}) if not isinstance(params, list) else params
         try:
-            if isinstance(request_body, bytes):
-                request_body = request_body.decode("utf-8")
+            if isinstance(request.body, bytes):
+                try:
+                    request_body = request.body.decode("utf-8")
+                except UnicodeDecodeError:
+                    request_body = gzip.decompress(request.body).decode("utf-8")
             json_body = json_module.loads(request_body) if request_body else {}
 
-            valid = params is None if request_body is None else params_dict == json_body
+            if (
+                not strict_match
+                and isinstance(json_body, dict)
+                and isinstance(json_params, dict)
+            ):
+                # filter down to just the params specified in the matcher
+                json_body = _filter_dict_recursively(json_body, json_params)
+
+            valid = params is None if request_body is None else json_params == json_body
 
             if not valid:
-                reason = "request.body doesn't match: {} doesn't match {}".format(
-                    _create_key_val_str(json_body), _create_key_val_str(params_dict)
-                )
+                reason = f"request.body doesn't match: {json_body} doesn't match {json_params}"
+                if not strict_match:
+                    reason += (
+                        "\nNote: You use non-strict parameters check, "
+                        "to change it use `strict_match=True`."
+                    )
 
         except JSONDecodeError:
             valid = False
@@ -104,57 +140,82 @@ def json_params_matcher(params):
     return match
 
 
-def fragment_identifier_matcher(identifier):
-    def match(request):
+def fragment_identifier_matcher(identifier: Optional[str]) -> Callable[..., Any]:
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = ""
         url_fragment = urlparse(request.url).fragment
         if identifier:
-            url_fragment_qsl = sorted(parse_qsl(url_fragment))
+            url_fragment_qsl = sorted(parse_qsl(url_fragment))  # type: ignore[type-var]
             identifier_qsl = sorted(parse_qsl(identifier))
             valid = identifier_qsl == url_fragment_qsl
         else:
             valid = not url_fragment
 
         if not valid:
-            reason = "URL fragment identifier is different: {} doesn't match {}".format(
-                identifier, url_fragment
+            reason = (
+                "URL fragment identifier is different: "  # type: ignore[str-bytes-safe]
+                f"{identifier} doesn't match {url_fragment}"
             )
+
         return valid, reason
 
     return match
 
 
-def query_param_matcher(params):
-    """
-    Matcher to match 'params' argument in request
+def query_param_matcher(
+    params: Optional[MutableMapping[str, Any]], *, strict_match: bool = True
+) -> Callable[..., Any]:
+    """Matcher to match 'params' argument in request.
 
-    :param params: (dict), same as provided to request
-    :return: (func) matcher
+    Parameters
+    ----------
+    params : dict
+        The same as provided to request or a part of it if used in
+        conjunction with ``strict_match=False``.
+    strict_match : bool, default=True
+        If set to ``True``, validates that all parameters match.
+        If set to ``False``, original request may contain additional parameters.
+
+
+    Returns
+    -------
+    Callable
+        Matcher function.
+
     """
 
-    def match(request):
+    params_dict = params or {}
+
+    for k, v in params_dict.items():
+        if isinstance(v, (int, float)):
+            params_dict[k] = str(v)
+
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = ""
-        request_params = request.params
+        request_params = request.params  # type: ignore[attr-defined]
         request_params_dict = request_params or {}
-        params_dict = params or {}
-        valid = (
-            params is None
-            if request_params is None
-            else params_dict == request_params_dict
-        )
+
+        if not strict_match:
+            # filter down to just the params specified in the matcher
+            request_params_dict = {
+                k: v for k, v in request_params_dict.items() if k in params_dict
+            }
+
+        valid = sorted(params_dict.items()) == sorted(request_params_dict.items())
 
         if not valid:
-            reason = "Parameters do not match. {} doesn't match {}".format(
-                _create_key_val_str(request_params_dict),
-                _create_key_val_str(params_dict),
-            )
+            reason = f"Parameters do not match. {request_params_dict} doesn't match {params_dict}"
+            if not strict_match:
+                reason += (
+                    "\nYou can use `strict_match=True` to do a strict parameters check."
+                )
 
         return valid, reason
 
     return match
 
 
-def query_string_matcher(query):
+def query_string_matcher(query: Optional[str]) -> Callable[..., Any]:
     """
     Matcher to match query string part of request
 
@@ -162,9 +223,9 @@ def query_string_matcher(query):
     :return: (func) matcher
     """
 
-    def match(request):
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = ""
-        data = parse_url(request.url)
+        data = parse_url(request.url or "")
         request_query = data.query
 
         request_qsl = sorted(parse_qsl(request_query)) if request_query else {}
@@ -173,9 +234,9 @@ def query_string_matcher(query):
         valid = not query if request_query is None else request_qsl == matcher_qsl
 
         if not valid:
-            reason = "Query string doesn't match. {} doesn't match {}".format(
-                _create_key_val_str(dict(request_qsl)),
-                _create_key_val_str(dict(matcher_qsl)),
+            reason = (
+                "Query string doesn't match. "
+                f"{dict(request_qsl)} doesn't match {dict(matcher_qsl)}"
             )
 
         return valid, reason
@@ -183,7 +244,7 @@ def query_string_matcher(query):
     return match
 
 
-def request_kwargs_matcher(kwargs):
+def request_kwargs_matcher(kwargs: Optional[Mapping[str, Any]]) -> Callable[..., Any]:
     """
     Matcher to match keyword arguments provided to request
 
@@ -191,23 +252,22 @@ def request_kwargs_matcher(kwargs):
     :return: (func) matcher
     """
 
-    def match(request):
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = ""
         kwargs_dict = kwargs or {}
         # validate only kwargs that were requested for comparison, skip defaults
-        request_kwargs = {
-            k: v for k, v in request.req_kwargs.items() if k in kwargs_dict
-        }
+        req_kwargs = request.req_kwargs  # type: ignore[attr-defined]
+        request_kwargs = {k: v for k, v in req_kwargs.items() if k in kwargs_dict}
 
         valid = (
             not kwargs_dict
             if not request_kwargs
-            else sorted(kwargs.items()) == sorted(request_kwargs.items())
+            else sorted(kwargs_dict.items()) == sorted(request_kwargs.items())
         )
 
         if not valid:
-            reason = "Arguments don't match: {} doesn't match {}".format(
-                _create_key_val_str(request_kwargs), _create_key_val_str(kwargs_dict)
+            reason = (
+                f"Arguments don't match: {request_kwargs} doesn't match {kwargs_dict}"
             )
 
         return valid, reason
@@ -215,7 +275,9 @@ def request_kwargs_matcher(kwargs):
     return match
 
 
-def multipart_matcher(files, data=None):
+def multipart_matcher(
+    files: Mapping[str, Any], data: Optional[Mapping[str, str]] = None
+) -> Callable[..., Any]:
     """
     Matcher to match 'multipart/form-data' content-type.
     This function constructs request body and headers from provided 'data' and 'files'
@@ -229,10 +291,10 @@ def multipart_matcher(files, data=None):
         raise TypeError("files argument cannot be empty")
 
     prepared = PreparedRequest()
-    prepared.headers = {"Content-Type": ""}
+    prepared.headers = {"Content-Type": ""}  # type: ignore[assignment]
     prepared.prepare_body(data=data, files=files)
 
-    def get_boundary(content_type):
+    def get_boundary(content_type: str) -> str:
         """
         Parse 'boundary' value from header.
 
@@ -244,7 +306,7 @@ def multipart_matcher(files, data=None):
 
         return content_type.split("boundary=")[1]
 
-    def match(request):
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
         reason = "multipart/form-data doesn't match. "
         if "Content-Type" not in request.headers:
             return False, reason + "Request is missing the 'Content-Type' header"
@@ -261,14 +323,16 @@ def multipart_matcher(files, data=None):
         )
 
         request_body = request.body
-        prepared_body = prepared.body
+        prepared_body = prepared.body or ""
 
         if isinstance(prepared_body, bytes):
             # since headers always come as str, need to convert to bytes
-            prepared_boundary = prepared_boundary.encode("utf-8")
-            request_boundary = request_boundary.encode("utf-8")
+            prepared_boundary = prepared_boundary.encode("utf-8")  # type: ignore[assignment]
+            request_boundary = request_boundary.encode("utf-8")  # type: ignore[assignment]
 
-        prepared_body = prepared_body.replace(prepared_boundary, request_boundary)
+        prepared_body = prepared_body.replace(
+            prepared_boundary, request_boundary  # type: ignore[arg-type]
+        )
 
         headers_valid = prepared_content_type == request_content_type
         if not headers_valid:
@@ -282,8 +346,12 @@ def multipart_matcher(files, data=None):
 
         body_valid = prepared_body == request_body
         if not body_valid:
-            return False, reason + "Request body differs. {} aren't equal {}".format(
-                request_body, prepared_body
+            return (
+                False,
+                reason
+                + "Request body differs. {} aren't equal {}".format(  # type: ignore[str-bytes-safe]
+                    request_body, prepared_body
+                ),
             )
 
         return True, ""
@@ -291,7 +359,9 @@ def multipart_matcher(files, data=None):
     return match
 
 
-def header_matcher(headers, strict_match=False):
+def header_matcher(
+    headers: Mapping[str, Union[str, Pattern[str]]], strict_match: bool = False
+) -> Callable[..., Any]:
     """
     Matcher to match 'headers' argument in request using the responses library.
 
@@ -306,18 +376,36 @@ def header_matcher(headers, strict_match=False):
     :return: (func) matcher
     """
 
-    def match(request):
-        request_headers = request.headers or {}
+    def _compare_with_regex(request_headers: Union[Mapping[Any, Any], Any]) -> bool:
+        if strict_match and len(request_headers) != len(headers):
+            return False
+
+        for k, v in headers.items():
+            if request_headers.get(k) is not None:
+                if isinstance(v, re.Pattern):
+                    if re.match(v, request_headers[k]) is None:
+                        return False
+                else:
+                    if not v == request_headers[k]:
+                        return False
+            else:
+                return False
+
+        return True
+
+    def match(request: PreparedRequest) -> Tuple[bool, str]:
+        request_headers: Union[Mapping[Any, Any], Any] = request.headers or {}
 
         if not strict_match:
             # filter down to just the headers specified in the matcher
             request_headers = {k: v for k, v in request_headers.items() if k in headers}
 
-        valid = sorted(headers.items()) == sorted(request_headers.items())
+        valid = _compare_with_regex(request_headers)
 
         if not valid:
-            return False, "Headers do not match: {} doesn't match {}".format(
-                _create_key_val_str(request_headers), _create_key_val_str(headers)
+            return (
+                False,
+                f"Headers do not match: {request_headers} doesn't match {headers}",
             )
 
         return valid, ""

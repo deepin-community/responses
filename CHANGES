@@ -1,3 +1,167 @@
+0.25.7
+------
+
+* Added support for python 3.13
+
+0.25.6
+------
+
+* Added py.typed to package_data
+
+0.25.5
+------
+
+* Fix readme issue that prevented 0.25.4 from being published to pypi.
+
+0.25.4
+------
+
+* Responses can now match requests that use `data` with file-like objects.
+  Files will be read as bytes and stored in the request mock. See #736
+* `RequestsMock.matchers` was added. This property is an alias to `responses.matchers`. See #739
+* Removed tests from packaged wheels. See #746
+* Improved recorder API to ease use in REPL environments. See #745
+
+0.25.3
+------
+
+* Fixed `recorder` not saving and loading response headers with yaml files. See #715
+
+0.25.2
+------
+
+* Mulligan on 0.25.1 to run release pipeline correctly.
+* Added `matchers.body_matcher` for matching string request bodies. See #717
+
+0.25.1
+------
+
+* Fixed tests failures during RPM package builds. See #706
+* Fix mocked HEAD responses that have `Content-Length` set. See #712
+* Fixed error messages when matches fail: inputs are not sorted or reformatted. See #704
+
+0.25.0
+------
+
+* Added support for Python 3.12
+* Fixed `matchers.header_matcher` not failing when a matched header is missing from the request. See #702
+
+
+0.24.1
+------
+
+* Reverted overloads removal
+* Added typing to `Call` attributes.
+* Fix socket issues (see #693)
+
+
+0.24.0
+------
+
+* Added `BaseResponse.calls` to access calls data of a separate mocked request. See #664
+* Added `real_adapter_send` parameter to `RequestsMock` that will allow users to set
+  through which function they would like to send real requests
+* Added support for re.Pattern based header matching.
+* Added support for gzipped response bodies to `json_params_matcher`.
+* Fix `Content-Type` headers issue when the header was duplicated. See #644
+* Moved types-pyyaml dependency to `tests_requires`
+* Removed Python3.7 support
+
+0.23.3
+------
+
+* Allow urllib3>=1.25.10
+
+
+0.23.2
+------
+
+> This release is the last to support Python 3.7
+
+* Updated dependency to urllib3>=2 and requests>=2.30.0. See #635
+* Fixed issue when custom adapters were sending only positional args. See #642
+* Expose `unbound_on_send` method in `RequestsMock` class. This method returns new function
+  that is called by `RequestsMock` instead of original `send` method defined by any adapter.
+
+
+0.23.1
+------
+
+* Remove `tomli` import. See #630
+
+0.23.0
+------
+
+* Add Python 3.11 support
+* Fix type annotations of `CallList`. See #593
+* `request` object is attached to any custom exception provided as `Response` `body` argument. See #588
+* Fixed mocked responses leaking between tests when `assert_all_requests_are_fired` and a request was not fired.
+* [BETA] Default recorder format was changed to YAML.  Added `responses.RequestsMock._parse_response_file` and
+  `responses._recorder.Recorder.dump_to_file` methods that allow users to override default parser to eg toml, json
+
+0.22.0
+------
+
+* Update `requests` dependency to the version of 2.22.0 or higher. See #584.
+* [BETA] Added possibility to record responses to TOML files via `@_recorder.record(file_path="out.toml")` decorator.
+* [BETA] Added possibility to replay responses (populate registry) from TOML files
+  via `responses._add_from_file(file_path="out.toml")` method.
+* Fix type for the `mock`'s patcher object. See #556
+* Fix type annotation for `CallList`
+* Add `passthrough` argument to `BaseResponse` object. See #557
+* Fix `registries` leak. See #563
+* `OriginalResponseShim` is removed. See #585
+* Add support for the `loose` version of `json_params_matcher` via named argument `strict_match`. See #551
+* Add lists support as JSON objects in `json_params_matcher`. See #559
+* Added project links to pypi listing.
+* `delete`, `get`, `head`, `options`, `patch`, `post`, `put` shortcuts are now implemented using `functools.partialmethod`.
+* Fix `MaxRetryError` exception. Replace exception by `RetryError` according to `requests` implementation. See #572.
+* Adjust error message when `Retry` is exhausted. See #580.
+
+0.21.0
+------
+
+* Add `threading.Lock()` to allow `responses` working with `threading` module.
+* Add `urllib3` `Retry` mechanism. See #135
+* Removed internal `_cookies_from_headers` function
+* Now `add`, `upsert`, `replace` methods return registered response.
+  `remove` method returns list of removed responses.
+* Added null value support in `urlencoded_params_matcher` via `allow_blank` keyword argument
+* Added strict version of decorator. Now you can apply `@responses.activate(assert_all_requests_are_fired=True)`
+  to your function to validate that all requests were executed in the wrapped function. See #183
+
+
+0.20.0
+------
+
+* Deprecate `responses.assert_all_requests_are_fired`, `responses.passthru_prefixes`, `responses.target`
+  since they are not actual properties of the class instance.
+  Use `responses.mock.assert_all_requests_are_fired`,
+  `responses.mock.passthru_prefixes`, `responses.mock.target` instead.
+* Fixed the issue when `reset()` method was called in not stopped mock. See #511
+
+0.19.0
+------
+
+* Added a registry that provides more strict ordering based on the invocation index.
+  See `responses.registries.OrderedRegistry`.
+* Added shortcuts for each request method: delete, get, head, options, patch, post, put.
+  For example, to add response for POST request you can use `responses.post()` instead
+  of `responses.add(responses.POST)`.
+* Prevent `responses.activate` decorator to leak, if wrapped function called from within another
+  wrapped function. Also, allow calling of above mentioned chain. See #481 for more details.
+* Expose `get_registry()` method of `RequestsMock` object. Replaces internal `_get_registry()`.
+* `query_param_matcher` can now accept dictionaries with `int` and `float` values.
+* Add support for the `loose` version of `query_param_matcher` via named argument `strict_match`.
+* Added support for `async/await` functions.
+* `response_callback` is no longer executed on exceptions raised by failed `Response`s
+* Change logic of `_get_url_and_path` to comply with RFC 3986. Now URL match occurs by matching
+  schema, authority and path, where path is terminated by the first question mark ("?") or
+  number sign ("#") character, or by the end of the URI.
+* An error is now raised when both `content_type` and `headers[content-type]` are provided as parameters.
+* When a request isn't matched the passthru prefixes are now included in error messages.
+
+
 0.18.0
 ------
 

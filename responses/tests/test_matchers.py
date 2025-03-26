@@ -1,22 +1,51 @@
-from __future__ import absolute_import, print_function, division, unicode_literals
+import gzip
+import re
+from typing import Any
+from typing import List
+from unittest.mock import Mock
 
 import pytest
 import requests
-import responses
 from requests.exceptions import ConnectionError
+
+import responses
 from responses import matchers
+from responses.tests.test_responses import assert_reset
+from responses.tests.test_responses import assert_response
 
 
-def assert_response(resp, body=None, content_type="text/plain"):
-    assert resp.status_code == 200
-    assert resp.reason == "OK"
-    assert resp.headers["Content-Type"] == content_type
-    assert resp.text == body
+def test_body_match_get():
+    @responses.activate
+    def run():
+        url = "http://example.com"
+        responses.add(
+            responses.GET,
+            url,
+            body=b"test",
+            match=[matchers.body_matcher("123456")],
+        )
+        resp = requests.get("http://example.com", data="123456")
+        assert_response(resp, "test")
+
+    run()
+    assert_reset()
 
 
-def assert_reset():
-    assert len(responses._default_mock.registered()) == 0
-    assert len(responses.calls) == 0
+def test_body_match_post():
+    @responses.activate
+    def run():
+        url = "http://example.com"
+        responses.add(
+            responses.POST,
+            url,
+            body=b"test",
+            match=[matchers.body_matcher("123456")],
+        )
+        resp = requests.post("http://example.com", data="123456")
+        assert_response(resp, "test")
+
+    run()
+    assert_reset()
 
 
 def test_query_string_matcher():
@@ -87,6 +116,196 @@ def test_request_matches_post_params():
     assert_reset()
 
 
+def test_json_params_matcher_not_strict():
+    @responses.activate(assert_all_requests_are_fired=True)
+    def run():
+        responses.add(
+            method=responses.POST,
+            url="http://example.com/",
+            body="one",
+            match=[
+                matchers.json_params_matcher(
+                    {"page": {"type": "json"}},
+                    strict_match=False,
+                )
+            ],
+        )
+
+        resp = requests.request(
+            "POST",
+            "http://example.com/",
+            headers={"Content-Type": "application/json"},
+            json={
+                "page": {"type": "json", "another": "nested"},
+                "not_strict": "must pass",
+            },
+        )
+        assert_response(resp, "one")
+
+    run()
+    assert_reset()
+
+
+def test_json_params_matcher_not_strict_diff_values():
+    @responses.activate
+    def run():
+        responses.add(
+            method=responses.POST,
+            url="http://example.com/",
+            body="one",
+            match=[
+                matchers.json_params_matcher(
+                    {"page": {"type": "json", "diff": "value"}}, strict_match=False
+                )
+            ],
+        )
+
+        with pytest.raises(ConnectionError) as exc:
+            requests.request(
+                "POST",
+                "http://example.com/",
+                headers={"Content-Type": "application/json"},
+                json={"page": {"type": "json"}, "not_strict": "must pass"},
+            )
+        assert (
+            "- POST http://example.com/ request.body doesn't match: "
+            "{'page': {'type': 'json'}} doesn't match {'page': {'type': 'json', 'diff': 'value'}}"
+        ) in str(exc.value)
+
+    run()
+    assert_reset()
+
+
+def test_failed_matchers_dont_modify_inputs_order_in_error_message():
+    json_a = {"array": ["C", "B", "A"]}
+    json_b = '{"array" : ["B", "A", "C"]}'
+    mock_request = Mock(body=json_b)
+    result = matchers.json_params_matcher(json_a)(mock_request)
+    assert result == (
+        False,
+        (
+            "request.body doesn't match: {'array': ['B', 'A', 'C']} "
+            "doesn't match {'array': ['C', 'B', 'A']}"
+        ),
+    )
+
+
+def test_json_params_matcher_json_list():
+    json_a = [{"a": "b"}]
+    json_b = '[{"a": "b", "c": "d"}]'
+    mock_request = Mock(body=json_b)
+    result = matchers.json_params_matcher(json_a)(mock_request)
+    assert result == (
+        False,
+        "request.body doesn't match: [{'a': 'b', 'c': 'd'}] doesn't match [{'a': 'b'}]",
+    )
+
+
+def test_json_params_matcher_json_list_empty():
+    json_a: "List[Any]" = []
+    json_b = "[]"
+    mock_request = Mock(body=json_b)
+    result = matchers.json_params_matcher(json_a)(mock_request)
+    assert result == (True, "")
+
+
+def test_json_params_matcher_body_is_gzipped():
+    json_a = {"foo": 42, "bar": None}
+    json_b = gzip.compress(b'{"foo": 42, "bar": null}')
+    mock_request = Mock(body=json_b)
+    result = matchers.json_params_matcher(json_a)(mock_request)
+    assert result == (True, "")
+
+
+def test_urlencoded_params_matcher_blank():
+    @responses.activate
+    def run():
+        responses.add(
+            method=responses.POST,
+            url="http://example.com/",
+            body="three",
+            match=[
+                matchers.urlencoded_params_matcher(
+                    {"page": "", "type": "urlencoded"}, allow_blank=True
+                )
+            ],
+        )
+
+        resp = requests.request(
+            "POST",
+            "http://example.com/",
+            headers={"Content-Type": "x-www-form-urlencoded"},
+            data={"page": "", "type": "urlencoded"},
+        )
+        assert_response(resp, "three")
+
+    run()
+    assert_reset()
+
+
+def test_query_params_numbers():
+    @responses.activate
+    def run():
+        expected_query_params = {"float": 5.0, "int": 2}
+        responses.add(
+            responses.GET,
+            "https://example.com/",
+            match=[
+                matchers.query_param_matcher(expected_query_params),
+            ],
+        )
+        requests.get("https://example.com", params=expected_query_params)
+
+    run()
+    assert_reset()
+
+
+def test_query_param_matcher_loose():
+    @responses.activate
+    def run():
+        expected_query_params = {"only_one_param": "test"}
+        responses.add(
+            responses.GET,
+            "https://example.com/",
+            match=[
+                matchers.query_param_matcher(expected_query_params, strict_match=False),
+            ],
+        )
+        requests.get(
+            "https://example.com", params={"only_one_param": "test", "second": "param"}
+        )
+
+    run()
+    assert_reset()
+
+
+def test_query_param_matcher_loose_fail():
+    @responses.activate
+    def run():
+        expected_query_params = {"does_not_exist": "test"}
+        responses.add(
+            responses.GET,
+            "https://example.com/",
+            match=[
+                matchers.query_param_matcher(expected_query_params, strict_match=False),
+            ],
+        )
+        with pytest.raises(ConnectionError) as exc:
+            requests.get(
+                "https://example.com",
+                params={"only_one_param": "test", "second": "param"},
+            )
+
+        assert (
+            "- GET https://example.com/ Parameters do not match. {} doesn't"
+            " match {'does_not_exist': 'test'}\n"
+            "You can use `strict_match=True` to do a strict parameters check."
+        ) in str(exc.value)
+
+    run()
+    assert_reset()
+
+
 def test_request_matches_empty_body():
     def run():
         with responses.RequestsMock(assert_all_requests_are_fired=True) as rsps:
@@ -125,7 +344,7 @@ def test_request_matches_empty_body():
             )
 
             with pytest.raises(ConnectionError) as excinfo:
-                resp = requests.request(
+                requests.request(
                     "POST",
                     "http://example.com/",
                     json={"my": "data"},
@@ -133,7 +352,7 @@ def test_request_matches_empty_body():
                 )
 
             msg = str(excinfo.value)
-            assert "request.body doesn't match: {my: data} doesn't match {}" in msg
+            assert "request.body doesn't match: {'my': 'data'} doesn't match {}" in msg
 
         with responses.RequestsMock(assert_all_requests_are_fired=False) as rsps:
             rsps.add(
@@ -143,7 +362,7 @@ def test_request_matches_empty_body():
                 match=[matchers.urlencoded_params_matcher(None)],
             )
             with pytest.raises(ConnectionError) as excinfo:
-                resp = requests.request(
+                requests.request(
                     "POST",
                     "http://example.com/",
                     headers={"Content-Type": "x-www-form-urlencoded"},
@@ -151,9 +370,9 @@ def test_request_matches_empty_body():
                 )
             msg = str(excinfo.value)
             assert (
-                "request.body doesn't match: {page: second, type: urlencoded} doesn't match {}"
-                in msg
-            )
+                "request.body doesn't match: {'page': 'second', "
+                "'type': 'urlencoded'} doesn't match {}"
+            ) in msg
 
     run()
     assert_reset()
@@ -218,7 +437,8 @@ def test_fail_matchers_error():
 
             msg = str(excinfo.value)
             assert (
-                "request.body doesn't match: {id: bad} doesn't match {foo: bar}" in msg
+                "request.body doesn't match: {'id': 'bad'} doesn't match {'foo': 'bar'}"
+                in msg
             )
 
             assert (
@@ -247,10 +467,11 @@ def test_fail_matchers_error():
 
             msg = str(excinfo.value)
             assert (
-                "Parameters do not match. {id: bad} doesn't match {my: params}" in msg
+                "Parameters do not match. {'id': 'bad'} doesn't match {'my': 'params'}"
+                in msg
             )
             assert (
-                "request.body doesn't match: {page: two} doesn't match {page: one}"
+                "request.body doesn't match: {'page': 'two'} doesn't match {'page': 'one'}"
                 in msg
             )
 
@@ -271,7 +492,7 @@ def test_fail_matchers_error():
             msg = str(excinfo.value)
             assert (
                 "Arguments don't match: "
-                "{stream: True, verify: True} doesn't match {stream: True, verify: False}"
+                "{'stream': True, 'verify': True} doesn't match {'stream': True, 'verify': False}"
             ) in msg
 
     run()
@@ -288,7 +509,7 @@ def test_fail_matchers_error():
         (b"\xacHello World!", b"\xacHello World!"),
     ],
 )
-def test_multipart_matcher(req_file, match_file):
+def test_multipart_matcher(req_file, match_file):  # type: ignore[misc]
     @responses.activate
     def run():
         req_data = {"some": "other", "data": "fields"}
@@ -416,9 +637,9 @@ def test_query_string_matcher_raises():
 
             msg = str(excinfo.value)
             assert (
-                "Query string doesn't match. {didi: pro, test: 1} doesn't match {didi: pro}"
-                in msg
-            )
+                "Query string doesn't match. {'didi': 'pro', 'test': '1'} "
+                "doesn't match {'didi': 'pro'}"
+            ) in msg
 
     run()
     assert_reset()
@@ -455,7 +676,7 @@ def test_request_matches_headers():
     assert_reset()
 
 
-def test_request_matches_headers_no_match():
+def test_request_header_value_mismatch_raises():
     @responses.activate
     def run():
         url = "http://example.com/"
@@ -471,8 +692,31 @@ def test_request_matches_headers_no_match():
 
         msg = str(excinfo.value)
         assert (
-            "Headers do not match: {Accept: application/xml} doesn't match "
-            "{Accept: application/json}"
+            "Headers do not match: {'Accept': 'application/xml'} doesn't match "
+            "{'Accept': 'application/json'}"
+        ) in msg
+
+    run()
+    assert_reset()
+
+
+def test_request_headers_missing_raises():
+    @responses.activate
+    def run():
+        url = "http://example.com/"
+        responses.add(
+            method=responses.GET,
+            url=url,
+            json={"success": True},
+            match=[matchers.header_matcher({"x-custom-header": "foo"})],
+        )
+
+        with pytest.raises(ConnectionError) as excinfo:
+            requests.get(url, headers={})
+
+        msg = str(excinfo.value)
+        assert (
+            "Headers do not match: {} doesn't match {'x-custom-header': 'foo'}"
         ) in msg
 
     run()
@@ -524,8 +768,8 @@ def test_request_matches_headers_strict_match():
 
         msg = str(excinfo.value)
         assert (
-            "Headers do not match: {Accept: text/plain, Accept-Charset: utf-8} "
-            "doesn't match {Accept: text/plain}"
+            "Headers do not match: {'Accept': 'text/plain', 'Accept-Charset': 'utf-8'} "
+            "doesn't match {'Accept': 'text/plain'}"
         ) in msg
 
     run()
@@ -600,26 +844,188 @@ def test_fragment_identifier_matcher_and_match_querystring():
     assert_reset()
 
 
-def test_matchers_create_key_val_str():
-    """
-    Test that matchers._create_key_val_str does recursive conversion
-    """
-    data = {
-        "my_list": [
-            1,
-            2,
-            "a",
-            {"key1": "val1", "key2": 2, 3: "test"},
-            "!",
-            [["list", "nested"], {"nested": "dict"}],
-        ],
-        1: 4,
-        "test": "val",
-        "high": {"nested": "nested_dict"},
-    }
-    conv_str = matchers._create_key_val_str(data)
-    reference = (
-        "{1: 4, high: {nested: nested_dict}, my_list: [!, 1, 2, [[list, nested], {nested: dict}], "
-        "a, {3: test, key1: val1, key2: 2}], test: val}"
-    )
-    assert conv_str == reference
+def test_matchers_under_requests_mock_object():
+    def run():
+        # ensure all access to responses or matchers is only going
+        # through the RequestsMock instance in the context manager
+        responses = None  # noqa: F841
+        matchers = None  # noqa: F841
+        from responses import RequestsMock
+
+        with RequestsMock(assert_all_requests_are_fired=True) as rsps:
+            url = "http://example.com"
+            rsps.add(
+                rsps.GET,
+                url,
+                body=b"test",
+                match=[rsps.matchers.body_matcher("123456")],
+            )
+            resp = requests.get("http://example.com", data="123456")
+            assert_response(resp, "test")
+
+    run()
+    assert_reset()
+
+
+class TestHeaderWithRegex:
+    @property
+    def url(self):  # type: ignore[misc]
+        return "http://example.com/"
+
+    def _register(self):
+        responses.add(
+            method=responses.GET,
+            url=self.url,
+            body="success",
+            match=[
+                matchers.header_matcher(
+                    {
+                        "Accept": "text/plain",
+                        "Message-Signature": re.compile(r'signature="\S+",created=\d+'),
+                    },
+                    strict_match=True,
+                )
+            ],
+        )
+
+    def test_request_matches_headers_regex(self):
+        @responses.activate
+        def run():
+            # this one can not use common _register method because different headers
+            responses.add(
+                method=responses.GET,
+                url=self.url,
+                json={"success": True},
+                match=[
+                    matchers.header_matcher(
+                        {
+                            "Message-Signature": re.compile(
+                                r'signature="\S+",created=\d+'
+                            ),
+                            "Authorization": "Bearer API_TOKEN",
+                        },
+                        strict_match=False,
+                    )
+                ],
+            )
+            # the actual request can contain extra headers (requests always adds some itself anyway)
+            resp = requests.get(
+                self.url,
+                headers={
+                    "Message-Signature": 'signature="abc",created=1243',
+                    "Authorization": "Bearer API_TOKEN",
+                },
+            )
+            assert_response(
+                resp, body='{"success": true}', content_type="application/json"
+            )
+
+        run()
+        assert_reset()
+
+    def test_request_matches_headers_regex_strict_match_regex_failed(self):
+        @responses.activate
+        def run():
+            self._register()
+            session = requests.Session()
+            # requests will add some extra headers of its own, so we have to use prepared requests
+            prepped = session.prepare_request(
+                requests.Request(
+                    method="GET",
+                    url=self.url,
+                )
+            )
+            prepped.headers.clear()
+            prepped.headers["Accept"] = "text/plain"
+            prepped.headers["Message-Signature"] = 'signature="123",created=abc'
+            with pytest.raises(ConnectionError) as excinfo:
+                session.send(prepped)
+            msg = str(excinfo.value)
+            assert (
+                "Headers do not match: {'Accept': 'text/plain', 'Message-Signature': "
+                """'signature="123",created=abc'} """
+                "doesn't match {'Accept': 'text/plain', 'Message-Signature': "
+                "re.compile('signature=\"\\\\S+\",created=\\\\d+')}"
+            ) in msg
+
+        run()
+        assert_reset()
+
+    def test_request_matches_headers_regex_strict_match_mismatched_field(self):
+        @responses.activate
+        def run():
+            self._register()
+            # requests will add some extra headers of its own, so we have to use prepared requests
+            session = requests.Session()
+            prepped = session.prepare_request(
+                requests.Request(
+                    method="GET",
+                    url=self.url,
+                )
+            )
+            prepped.headers.clear()
+            prepped.headers["Accept"] = "text/plain"
+            prepped.headers["Accept-Charset"] = "utf-8"
+            # "Accept-Charset" header will fail to match to "Message-Signature"
+            with pytest.raises(ConnectionError) as excinfo:
+                session.send(prepped)
+            msg = str(excinfo.value)
+            assert (
+                "Headers do not match: {'Accept': 'text/plain', 'Accept-Charset': 'utf-8'} "
+                "doesn't match {'Accept': 'text/plain', 'Message-Signature': "
+                "re.compile('signature=\"\\\\S+\",created=\\\\d+')}"
+            ) in msg
+
+        run()
+        assert_reset()
+
+    def test_request_matches_headers_regex_strict_match_mismatched_number(self):
+        @responses.activate
+        def run():
+            self._register()
+            # requests will add some extra headers of its own, so we have to use prepared requests
+            session = requests.Session()
+            # include the "Accept-Charset" header, which will fail to match
+            prepped = session.prepare_request(
+                requests.Request(
+                    method="GET",
+                    url=self.url,
+                )
+            )
+            prepped.headers.clear()
+            prepped.headers["Accept"] = "text/plain"
+            prepped.headers["Accept-Charset"] = "utf-8"
+            prepped.headers["Message-Signature"] = 'signature="abc",created=1243'
+            with pytest.raises(ConnectionError) as excinfo:
+                session.send(prepped)
+            msg = str(excinfo.value)
+            assert (
+                "Headers do not match: {'Accept': 'text/plain', 'Accept-Charset': 'utf-8', "
+                """'Message-Signature': 'signature="abc",created=1243'} """
+                "doesn't match {'Accept': 'text/plain', 'Message-Signature': "
+                "re.compile('signature=\"\\\\S+\",created=\\\\d+')}"
+            ) in msg
+
+        run()
+        assert_reset()
+
+    def test_request_matches_headers_regex_strict_match_positive(self):
+        @responses.activate
+        def run():
+            self._register()
+            # requests will add some extra headers of its own, so we have to use prepared requests
+            session = requests.Session()
+            prepped = session.prepare_request(
+                requests.Request(
+                    method="GET",
+                    url=self.url,
+                )
+            )
+            prepped.headers.clear()
+            prepped.headers["Accept"] = "text/plain"
+            prepped.headers["Message-Signature"] = 'signature="abc",created=1243'
+            resp = session.send(prepped)
+            assert_response(resp, body="success", content_type="text/plain")
+
+        run()
+        assert_reset()
